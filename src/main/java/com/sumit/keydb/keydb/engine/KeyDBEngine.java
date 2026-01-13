@@ -38,6 +38,11 @@ public class KeyDBEngine {
     private RandomAccessFile activeFile;
     private int activeFileId;
 
+    private int pendingWrites = 0;
+    private long lastSyncTime = System.nanoTime();
+    private static final int SYNC_EVERY_N = 500;
+    private static final long SYNC_EVERY_NS = 5_000_000;
+
     public KeyDBEngine(StorageConfig storageConfig) {
         this.MAX_SEGMENT_SIZE = storageConfig.getMaxFileSize();
         this.dataDir = Paths.get(storageConfig.getDataDir());
@@ -207,7 +212,15 @@ public class KeyDBEngine {
             long offset = activeFile.length();
             activeFile.seek(offset);
             activeFile.write(data);
-            activeFile.getFD().sync(); // <---- Slowness
+            pendingWrites++;
+
+            long now = System.nanoTime();
+            if (pendingWrites >= SYNC_EVERY_N || now - lastSyncTime > SYNC_EVERY_NS) {
+                activeFile.getFD().sync();
+                pendingWrites = 0;
+                lastSyncTime = now;
+            }
+
             long valueOffset = offset + LogEntry.HEADER_SIZE + key.getBytes(StandardCharsets.UTF_8).length;
             if ("v0".equals(value)) {
                 System.out.println("Length: " + value.length());
