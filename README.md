@@ -17,6 +17,7 @@ This project was built as part of a **storage engine / database systems take-hom
 * Crash-safe recovery without data loss
 * Manual compaction to reclaim disk space
 * REST API for interaction
+* Replication layer for high availability.
 
 ---
 
