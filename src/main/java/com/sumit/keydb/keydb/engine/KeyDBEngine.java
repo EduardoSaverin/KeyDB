@@ -3,12 +3,14 @@ package com.sumit.keydb.keydb.engine;
 import com.sumit.keydb.keydb.common.StorageConfig;
 import com.sumit.keydb.keydb.model.KeyDirEntry;
 import com.sumit.keydb.keydb.model.LogEntry;
+import com.sumit.keydb.keydb.model.ValueWithMeta;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.log4j.Log4j2;
 import org.springframework.stereotype.Component;
 
 import java.io.*;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -18,7 +20,9 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.zip.CRC32;
 
 @Component
 @Log4j2
@@ -27,6 +31,7 @@ public class KeyDBEngine {
     private final long MAX_SEGMENT_SIZE;
     private final Map<String, KeyDirEntry> keyDir = new ConcurrentHashMap<>();
     private final Map<Integer, RandomAccessFile> fileHandles = new ConcurrentHashMap<>();
+    private final Set<Integer> sealedFiles = ConcurrentHashMap.newKeySet();
     private final Set<Integer> missingHintFiles = ConcurrentHashMap.newKeySet();
     private final ExecutorService hintBuilder = Executors.newSingleThreadExecutor(r -> {
         Thread thread = new Thread(r);
@@ -34,16 +39,18 @@ public class KeyDBEngine {
         return thread;
     });
     private final ReentrantLock WRITE_LOCK = new ReentrantLock();
-
+    private final AtomicLong versionClock = new AtomicLong();
     private RandomAccessFile activeFile;
     private int activeFileId;
+    private long activeOffset;
 
     private int pendingWrites = 0;
     private long lastSyncTime = System.nanoTime();
-    private static final int SYNC_EVERY_N = 500;
-    private static final long SYNC_EVERY_NS = 5_000_000;
+    private static final int SYNC_EVERY_N = 2_000;
+    private static final long SYNC_EVERY_NS = 20_000_000;
 
     public KeyDBEngine(StorageConfig storageConfig) {
+        log.info("Data Directory : {}", storageConfig.getDataDir());
         this.MAX_SEGMENT_SIZE = storageConfig.getMaxFileSize();
         this.dataDir = Paths.get(storageConfig.getDataDir());
     }
@@ -58,6 +65,7 @@ public class KeyDBEngine {
         loadFromDisk();
         activeFileId = nextFileId();
         activeFile = openFile(activeFileId);
+        activeOffset = activeFile.length();
         hintBuilder.submit(this::buildMissingHints);
     }
 
@@ -84,7 +92,7 @@ public class KeyDBEngine {
     /* ===================== Hint Files ===================== */
     private void writeHintFile(int fileId) throws IOException {
         Path hintPath = hintFilePath(fileId);
-        Path tmpHintPath = hintFilePath(fileId);
+        Path tmpHintPath = tmpHintFilePath(fileId);
         try (DataOutputStream out = new DataOutputStream(
                 new BufferedOutputStream(Files.newOutputStream(tmpHintPath)))) {
             for (var e : this.keyDir.entrySet()) {
@@ -97,7 +105,7 @@ public class KeyDBEngine {
                 out.write(keyBytes);
                 out.writeLong(entry.valueOffset());
                 out.writeInt(entry.valueLength());
-                out.writeLong(System.currentTimeMillis());
+                out.writeLong(entry.timestamp());
             }
         }
         Files.move(
@@ -119,7 +127,7 @@ public class KeyDBEngine {
                 out.write(keyBytes);
                 out.writeLong(dirEntry.valueOffset());
                 out.writeInt(dirEntry.valueLength());
-                out.writeLong(System.currentTimeMillis());
+                out.writeLong(dirEntry.timestamp());
             }
         }
     }
@@ -167,8 +175,13 @@ public class KeyDBEngine {
     /* ===================== Log Scan Fallback ===================== */
     private void rebuildKeyDirFromLog(RandomAccessFile raf, int fileId) throws IOException {
         long offset = 0;
+        long fileLength = raf.length();
         while (offset < raf.length()) {
+            if (offset + LogEntry.HEADER_SIZE > fileLength) {
+                break;
+            }
             raf.seek(offset);
+            // Read Header
             byte[] header = new byte[LogEntry.HEADER_SIZE];
             raf.readFully(header);
 
@@ -177,41 +190,86 @@ public class KeyDBEngine {
             long timestamp = byteBuffer.getLong(); // timestamp
             int keySize = byteBuffer.getInt();
             int valueSize = byteBuffer.getInt();
+
+            if (keySize <= 0 || keySize > 1024 * 1024) {
+                log.warn("Invalid keySize {} at offset {} in file {}", keySize, offset, fileId);
+                break;
+            }
+            if (valueSize < -1 || valueSize > 1024 * 1024 * 10) {
+                log.warn("Invalid valueSize {} at offset {} in file {}", valueSize, offset, fileId);
+                break;
+            }
+
+            int valueLen = Math.max(valueSize, 0);
+            int recordSize = LogEntry.HEADER_SIZE + keySize + valueLen;
+
+            // Ensure full record exists
+            if (offset + recordSize > fileLength) {
+                log.warn("Truncated record at offset {} in file {}", offset, fileId);
+                break;
+            }
+
+            // Read full record
+            byte[] record = new byte[recordSize];
+            raf.seek(offset);
+            raf.readFully(record);
+
+            // CRC Validation
+            CRC32 crc32 = new CRC32();
+            crc32.update(record, 4, record.length - 4); // exclude CRC field
+            int computedCrc = (int) crc32.getValue();
+
+            if (computedCrc != crc) {
+                log.warn(
+                        "CRC mismatch at offset {} in file {} (expected {}, got {})",
+                        offset, fileId, crc, computedCrc
+                );
+                break;
+            }
+
             // Key
-            byte[] keyBytes = new byte[keySize];
-            raf.readFully(keyBytes);
+            int pos = LogEntry.HEADER_SIZE;
+            byte[] keyBytes = Arrays.copyOfRange(record, pos, pos + keySize);
+
             String key = new String(keyBytes, StandardCharsets.UTF_8);
             if (valueSize == -1) {
                 // Tombstone
-                this.keyDir.remove(key);
+                KeyDirEntry existing = keyDir.get(key);
+                if (existing == null || existing.timestamp() < timestamp) {
+                    keyDir.put(key, new KeyDirEntry(fileId, -1, -1, timestamp));
+                }
             } else {
                 // Value
                 long valueOffset = offset + LogEntry.HEADER_SIZE + keySize;
-                boolean addEntry = true;
-                if (keyDir.containsKey(key)) {
-                    KeyDirEntry entry = keyDir.get(key);
-                    if (entry.timestamp() > timestamp) {
-                        // Key Dir Already has new value
-                        addEntry = false;
-                    }
-                }
-                if (addEntry) {
-                    this.keyDir.put(key, new KeyDirEntry(fileId, valueOffset, valueSize, timestamp));
+                KeyDirEntry existing = keyDir.get(key);
+                if (existing == null || existing.timestamp() < timestamp) {
+                    keyDir.put(
+                            key,
+                            new KeyDirEntry(fileId, valueOffset, valueSize, timestamp)
+                    );
                 }
             }
-            offset += LogEntry.HEADER_SIZE + keySize + Math.max(valueSize, 0);
+            offset += recordSize;
         }
     }
 
     /* ===================== Write Operations ===================== */
-    public void put(String key, String value) throws IOException {
+    public void put(String key, String value, long timestamp) throws IOException {
+        if (value == null) {
+            this.delete(key);
+            return;
+        }
         WRITE_LOCK.lock();
         try {
             rotateIfNeeded();
-            byte[] data = LogEntry.serialize(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8));
-            long offset = activeFile.length();
-            activeFile.seek(offset);
-            activeFile.write(data);
+            byte[] valueBytes = value.getBytes(StandardCharsets.UTF_8);
+            byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+            byte[] data = LogEntry.serializeWithTimestamp(keyBytes, valueBytes, timestamp);
+
+            long offset = activeOffset;
+            FileChannel channel = activeFile.getChannel();
+            channel.write(ByteBuffer.wrap(data), offset);
+            activeOffset += data.length;
             pendingWrites++;
 
             long now = System.nanoTime();
@@ -221,11 +279,18 @@ public class KeyDBEngine {
                 lastSyncTime = now;
             }
 
-            long valueOffset = offset + LogEntry.HEADER_SIZE + key.getBytes(StandardCharsets.UTF_8).length;
-            if ("v0".equals(value)) {
-                System.out.println("Length: " + value.length());
-            }
-            this.keyDir.put(key, new KeyDirEntry(activeFileId, valueOffset, value.length(), System.currentTimeMillis()));
+            long valueOffset = offset + LogEntry.HEADER_SIZE + keyBytes.length;
+            keyDir.compute(key, (k, existing) -> {
+                if (existing == null || existing.timestamp() < timestamp) {
+                    return new KeyDirEntry(
+                            activeFileId,
+                            valueOffset,
+                            valueBytes.length,
+                            timestamp
+                    );
+                }
+                return existing;
+            });
         } finally {
             WRITE_LOCK.unlock();
         }
@@ -235,24 +300,20 @@ public class KeyDBEngine {
         WRITE_LOCK.lock();
         try {
             rotateIfNeeded();
-            byte[] data = LogEntry.serialize(key.getBytes(StandardCharsets.UTF_8), null);
-            activeFile.seek(activeFile.length());
+            byte[] data = LogEntry.serializeWithTimestamp(key.getBytes(StandardCharsets.UTF_8), null, getVersionClock());
+            activeFile.seek(activeFile.getFilePointer());
             activeFile.write(data);
             activeFile.getFD().sync();
             this.keyDir.remove(key);
+            activeOffset = 0;
         } finally {
             WRITE_LOCK.unlock();
         }
     }
 
     public void batchPut(Map<String, String> items) throws IOException {
-        WRITE_LOCK.lock();
-        try {
-            for (var e : items.entrySet()) {
-                this.put(e.getKey(), e.getValue());
-            }
-        } finally {
-            WRITE_LOCK.unlock();
+        for (var e : items.entrySet()) {
+            this.put(e.getKey(), e.getValue(), getVersionClock());
         }
     }
 
@@ -263,12 +324,30 @@ public class KeyDBEngine {
         if (entry == null) {
             return null;
         }
-        System.out.println("Reading File ID: " + entry.fileId());
         RandomAccessFile raf = openFile(entry.fileId());
-        raf.seek(entry.valueOffset());
-        byte[] value = new byte[entry.valueLength()];
-        raf.readFully(value);
-        return new String(value);
+        if (entry.valueOffset() + entry.valueLength() > raf.length()) {
+            throw new IOException("Corrupted offset for key: " + key);
+        }
+
+        FileChannel channel = raf.getChannel();
+        ByteBuffer buf = ByteBuffer.allocate(entry.valueLength());
+        channel.read(buf, entry.valueOffset());
+        return new String(buf.array(), StandardCharsets.UTF_8);
+    }
+
+    public ValueWithMeta getWithMeta(String key) throws IOException {
+        KeyDirEntry entry = this.keyDir.get(key);
+        if (entry == null) {
+            return null;
+        }
+        RandomAccessFile raf = openFile(entry.fileId());
+        if (entry.valueOffset() + entry.valueLength() > raf.length()) {
+            throw new IOException("Corrupted offset for key: " + key);
+        }
+        FileChannel channel = raf.getChannel();
+        ByteBuffer buf = ByteBuffer.allocate(entry.valueLength());
+        channel.read(buf, entry.valueOffset());
+        return new ValueWithMeta(new String(buf.array(), StandardCharsets.UTF_8), entry.timestamp());
     }
 
     public Map<String, String> range(String start, String end) throws IOException {
@@ -276,6 +355,16 @@ public class KeyDBEngine {
         for (String key : keyDir.keySet()) {
             if (key.compareTo(start) >= 0 && key.compareTo(end) <= 0) {
                 result.put(key, get(key));
+            }
+        }
+        return result;
+    }
+
+    public Map<String, ValueWithMeta> rangeWithMeta(String start, String end) throws IOException {
+        Map<String, ValueWithMeta> result = new TreeMap<>();
+        for (String key : keyDir.keySet()) {
+            if (key.compareTo(start) >= 0 && key.compareTo(end) <= 0) {
+                result.put(key, getWithMeta(key));
             }
         }
         return result;
@@ -292,7 +381,7 @@ public class KeyDBEngine {
         WRITE_LOCK.lock();
         try {
             snapshot = new HashMap<>(keyDir);
-            compactableFiles = new HashSet<>(fileHandles.keySet());
+            compactableFiles = new HashSet<>(sealedFiles);
             compactableFiles.remove(activeFileId);
             log.debug("Snapshot created");
         } finally {
@@ -306,6 +395,7 @@ public class KeyDBEngine {
         // Copy
         log.debug("Starting copy");
         int mergeFileId = nextFileId();
+        long mergeOffset = 0;
         RandomAccessFile mergeFile = openFile(mergeFileId);
         Map<String, KeyDirEntry> mergedEntries = new HashMap<>();
         for (var e : snapshot.entrySet()) {
@@ -314,31 +404,35 @@ public class KeyDBEngine {
             if (!compactableFiles.contains(entry.fileId())) {
                 continue;
             }
-            RandomAccessFile src = openFile(entry.fileId());
-            src.seek(entry.valueOffset());
-
-            byte[] valueBytes = new byte[entry.valueLength()];
-            src.readFully(valueBytes);
-
-            String value = new String(valueBytes, StandardCharsets.UTF_8);
-            if ("k0".equals(key)) {
-                System.out.println("Key: " + key + " Value: " + value);
-            }
-
-            byte[] logEntry = LogEntry.serialize(key.getBytes(StandardCharsets.UTF_8), valueBytes);
-            long offset = mergeFile.length();
-            mergeFile.seek(offset);
-            mergeFile.write(logEntry);
-
-            long valueOffset = offset + LogEntry.HEADER_SIZE + key.getBytes(StandardCharsets.UTF_8).length;
-            KeyDirEntry newEntry = new KeyDirEntry(mergeFileId, valueOffset, value.length(), entry.timestamp());
             if (mergedEntries.containsKey(key)) {
-                KeyDirEntry existingMergedEntry = mergedEntries.get(value);
-                if (existingMergedEntry.timestamp() > entry.timestamp()) {
-                    newEntry = new KeyDirEntry(mergeFileId, valueOffset, existingMergedEntry.valueLength(), existingMergedEntry.timestamp());
+                if (mergedEntries.get(key).timestamp() > entry.timestamp()) {
+                    continue;
                 }
             }
+            if (entry.valueLength() < 0) {
+                // Tombstone —  we do not copy this
+                continue;
+            }
+            RandomAccessFile src = openFile(entry.fileId());
+            src.seek(entry.valueOffset());
+            byte[] valueBytes = new byte[entry.valueLength()];
+            src.readFully(valueBytes);
+            byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+            System.out.println("Value:" + new String(valueBytes, StandardCharsets.UTF_8));
+            // Record
+            long recordOffset = entry.valueOffset() - (LogEntry.HEADER_SIZE + keyBytes.length);
+            src.seek(recordOffset);
+            byte[] record = new byte[LogEntry.HEADER_SIZE + keyBytes.length + entry.valueLength()];
+            src.readFully(record);
+
+            //byte[] logEntry = LogEntry.serializeWithTimestamp(keyBytes, valueBytes, entry.timestamp());
+            mergeFile.seek(mergeOffset);
+            mergeFile.write(record);
+
+            long valueOffset = mergeOffset + LogEntry.HEADER_SIZE + keyBytes.length;
+            KeyDirEntry newEntry = new KeyDirEntry(mergeFileId, valueOffset, valueBytes.length, entry.timestamp());
             mergedEntries.put(key, newEntry);
+            mergeOffset += record.length;
         }
         log.debug("Compacted File Entry Size: {}, Merge File ID: {}", mergedEntries.size(), mergeFileId);
         mergeFile.getFD().sync();
@@ -346,20 +440,18 @@ public class KeyDBEngine {
 
         // Swapping
         log.debug("Swapping files");
-        WRITE_LOCK.lock();
-        try {
-            for (var e : mergedEntries.entrySet()) {
-                KeyDirEntry current = keyDir.get(e.getKey());
-                KeyDirEntry newEntry = e.getValue();
-                if (current != null && compactableFiles.contains(current.fileId())) {
-                    System.out.println("New File ID: " + newEntry.fileId() + " Current File ID: " + current.fileId());
-                    fileHandles.put(newEntry.fileId(), mergeFile);
+        for (var e : mergedEntries.entrySet()) {
+            KeyDirEntry current = keyDir.get(e.getKey());
+            KeyDirEntry newEntry = e.getValue();
+            if (current != null && compactableFiles.contains(current.fileId())) {
+                fileHandles.put(newEntry.fileId(), mergeFile);
+                // Issue was here putting blindly value
+                // keyDir.put(e.getKey(), newEntry);
+                if (current.timestamp() < newEntry.timestamp()) {
                     keyDir.put(e.getKey(), newEntry);
-                    // closeAndDelete(current.fileId());
                 }
+                // closeAndDelete(current.fileId());
             }
-        } finally {
-            WRITE_LOCK.unlock();
         }
         log.debug("Compaction finished");
     }
@@ -376,26 +468,22 @@ public class KeyDBEngine {
     }
 
     private void rotateIfNeeded() throws IOException {
-        WRITE_LOCK.lock();
-        try {
             if (activeFile.length() < MAX_SEGMENT_SIZE) {
                 return;
             }
             // Swapping Atomically
             int newFileId = nextFileId();
             RandomAccessFile newFile = openFile(newFileId);
-
             RandomAccessFile oldFile = activeFile;
             activeFile = newFile;
 
             int oldFileId = activeFileId;
             activeFileId = newFileId;
+            activeOffset = 0;
 
             oldFile.getFD().sync();
             writeHintFile(oldFileId);
-        } finally {
-            WRITE_LOCK.unlock();
-        }
+            sealedFiles.add(oldFileId);
     }
 
     private RandomAccessFile openFile(int fileId) {
@@ -437,5 +525,13 @@ public class KeyDBEngine {
 
     private Path hintFilePath(int fileId) {
         return dataDir.resolve("data_" + fileId + ".hint");
+    }
+
+    private Path tmpHintFilePath(int fileId) {
+        return dataDir.resolve("data_" + fileId + ".hint.tmp");
+    }
+
+    public long getVersionClock() {
+        return versionClock.incrementAndGet();
     }
 }

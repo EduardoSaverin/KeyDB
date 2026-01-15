@@ -50,8 +50,8 @@ public class KeyDBEngineTest {
     /* ===================== Basic Operations ===================== */
     @Test
     void testPutAndGet() throws IOException {
-        this.keyDBEngine.put("key", "value");
-        this.keyDBEngine.put("alpha", "beta");
+        this.keyDBEngine.put("key", "value", System.currentTimeMillis());
+        this.keyDBEngine.put("alpha", "beta", System.currentTimeMillis());
 
         assertEquals("value", this.keyDBEngine.get("key"));
         assertEquals("beta", this.keyDBEngine.get("alpha"));
@@ -60,8 +60,8 @@ public class KeyDBEngineTest {
 
     @Test
     void testOverwriteKey() throws IOException {
-        this.keyDBEngine.put("key", "value");
-        this.keyDBEngine.put("key", "value2");
+        this.keyDBEngine.put("key", "value", System.currentTimeMillis());
+        this.keyDBEngine.put("key", "value2", System.currentTimeMillis());
 
         assertEquals("value2", this.keyDBEngine.get("key"));
     }
@@ -81,10 +81,10 @@ public class KeyDBEngineTest {
 
     @Test
     void testRangeQuery() throws IOException {
-        this.keyDBEngine.put("a", "1");
-        this.keyDBEngine.put("b", "2");
-        this.keyDBEngine.put("c", "3");
-        this.keyDBEngine.put("d", "4");
+        this.keyDBEngine.put("a", "1", System.currentTimeMillis());
+        this.keyDBEngine.put("b", "2", System.currentTimeMillis());
+        this.keyDBEngine.put("c", "3", System.currentTimeMillis());
+        this.keyDBEngine.put("d", "4", System.currentTimeMillis());
 
         Map<String, String> result = this.keyDBEngine.range("b", "c");
 
@@ -96,8 +96,8 @@ public class KeyDBEngineTest {
     /* ===================== Persistence ===================== */
     @Test
     void testRestartRecovery() throws IOException {
-        this.keyDBEngine.put("key", "value");
-        this.keyDBEngine.put("alpha", "beta");
+        this.keyDBEngine.put("key", "value", System.currentTimeMillis());
+        this.keyDBEngine.put("alpha", "beta", System.currentTimeMillis());
 
         StorageConfig storageConfig = new StorageConfig();
         storageConfig.setMaxFileSize(256);
@@ -113,7 +113,7 @@ public class KeyDBEngineTest {
     @Test
     void testCompaction() throws IOException {
         for (int i = 0; i < 100; i++) {
-            this.keyDBEngine.put("k" + i, "v" + i);
+            this.keyDBEngine.put("k" + i, "v" + i, System.currentTimeMillis());
         }
 
         StorageConfig storageConfig = new StorageConfig();
@@ -141,7 +141,7 @@ public class KeyDBEngineTest {
                 executorService.submit(() -> {
                     try {
                         for (int j = 0; j < opsPerThread; j++) {
-                            this.keyDBEngine.put("k-" + threadId + "-" + j, "v-" + j);
+                            this.keyDBEngine.put("k-" + threadId + "-" + j, "v-" + j, System.currentTimeMillis());
                         }
                     } catch (IOException e) {
                         fail(e);
@@ -169,7 +169,7 @@ public class KeyDBEngineTest {
         int totalWrites = 50_000;
         long startTime = System.nanoTime();
         for (int i = 0; i < totalWrites; i++) {
-            this.keyDBEngine.put("k" + i, "v" + i);
+            this.keyDBEngine.put("k" + i, "v" + i, System.currentTimeMillis());
         }
         long endTime = System.nanoTime();
 
@@ -185,7 +185,7 @@ public class KeyDBEngineTest {
         int total = 20_000;
 
         for (int i = 0; i < total; i++) {
-            this.keyDBEngine.put("k" + i, "v" + i);
+            this.keyDBEngine.put("k" + i, "v" + i, System.currentTimeMillis());
         }
 
         long startTime = System.nanoTime();

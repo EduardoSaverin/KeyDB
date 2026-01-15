@@ -124,6 +124,7 @@ This reclaims disk space while keeping reads available.
 * **Writes** protected by a single write lock
 * **Reads** are lock-free
 * One `RandomAccessFile` per segment (shared, never duplicated)
+* `RandomAccessFile` is backed with `FileChannel` to make it thread-safe
 * File handles are reused safely via `computeIfAbsent`
 
 Guarantees:
@@ -134,13 +135,96 @@ Guarantees:
 
 ---
 
+## 🔄 Replication Model
+All client requests are handled by a central `ReplicationCoordinator`.
+
+Each replica consists of:
+
+* A unique replica ID
+* An independent `KeyDBEngine`
+* A dedicated data directory
+* Its own in-memory key directory (`keyDir`)
+
+Storage engines are replication-agnostic. All quorum logic, retries, and repairs are managed by the coordinator.
+
+---
+## ☢️ Quorum Configuration (N, W, R)
+
+Replication behavior is controlled using three parameters:
+* **N** – Total number of replicas
+* **W** – Write quorum (minimum replicas required to acknowledge a write)
+* **R** – Read quorum (minimum replicas required to answer a read)
+
+The system follows the quorum rule:
+```java
+R + W > N
+```
+This ensures that at least one replica in every read quorum has observed the most recent successful write.
+
+---
+
+## 📝 Write Path (PUT / DELETE)
+1. Each write is assigned a **monotonically increasing version** using a global version clock.
+2. The write is dispatched **concurrently** to all replicas.
+3. The coordinator waits for **W acknowledgements**.
+4. Once W replicas respond successfully, the write is considered committed.
+5. Failed replicas are handled using hinted handoff.
+
+Conflict resolution uses **last-write-wins** based on version timestamps.
+
+Writes are non-blocking with respect to slow or unavailable replicas.
+
+---
+## 👓 Read Path (GET)
+1. Read requests are sent concurrently to all replicas.
+2. The coordinator waits for **R responses**.
+3. The value with the **highest version timestamp** is selected.
+4. The value is immediately returned to the client.
+5. **Read repair** is triggered asynchronously for stale replicas.
+
+Reads prioritize low latency and never wait for repairs to complete.
+
+---
+## 🧑🏼‍🔧 Read Repair
+When replicas return different versions of the same key:
+
+* The coordinator identifies the newest version.
+* Stale replicas are asynchronously updated.
+* The client response is not delayed.
+
+This allows replicas to converge naturally over time without coordination overhead.
+
+---
+## 🖐 Hinted Handoff
+
+If a replica is unavailable during a write:
+* The write is recorded as a **hint**.
+* Hints are stored persistently.
+* Once the replica becomes available, hints are replayed automatically.
+
+This prevents data loss during temporary failures or restarts.
+
+---
+## 🔏 Consistency Guarantees
+
+KeyDB provides **eventual consistency** with the following guarantees:
+
+* Writes succeed as long as **W replicas** are reachable
+* Reads return the latest value once **R replicas** respond
+* Temporary inconsistencies are resolved automatically
+* No committed data is lost
+* Replica crashes are safely recovered via log replay
+
+---
+
 ## 🚀 Performance Characteristics
 
 Measured on local SSD:
 
-| Configuration              | Throughput       |
-| -------------------------- | ---------------- |
-| fsync per write            | ~8k ops/sec      |
+| Configuration            | Throughput   |
+|--------------------------|--------------|
+| fsync per write          | ~8k ops/sec  |
+| deferred fsync per write | ~10k ops/sec |
 
 Trade-offs are explicitly documented and configurable.
 
@@ -189,7 +273,6 @@ Special care is taken to:
 
 ## 📌 Known Limitations
 
-* No replication (single-node)
 * Compaction is manual (can be automated)
 * Durability level is configurable but not pluggable yet
 * No TTL support (easy to add)
@@ -198,9 +281,8 @@ Special care is taken to:
 
 ## 🔮 Future Improvements
 
-* Replication & leader/follower model
 * Automatic background compaction
-* Async writer thread
+* Async writer thread (this will improve write speed 10x)
 * Reference-counted file handles
 * Bloom filters for faster negative lookups
 * Metrics (latency, throughput)
